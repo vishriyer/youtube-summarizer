@@ -50,13 +50,22 @@ def extract_video_id(url: str) -> str:
     raise ValueError(f"Could not extract a video ID from URL: {url}")
 
 
-def fetch_transcript(video_id: str, lang: str = "en") -> str:
+def fetch_transcript(video_id: str, lang: str = "en", proxy_username: str = None, proxy_password: str = None) -> str:
     from youtube_transcript_api import YouTubeTranscriptApi
     from youtube_transcript_api._errors import (
         TranscriptsDisabled, NoTranscriptFound, VideoUnavailable,
     )
+
+    proxy_config = None
+    if proxy_username and proxy_password:
+        from youtube_transcript_api.proxies import WebshareProxyConfig
+        proxy_config = WebshareProxyConfig(
+            proxy_username=proxy_username,
+            proxy_password=proxy_password,
+        )
+
     try:
-        ytt = YouTubeTranscriptApi()
+        ytt = YouTubeTranscriptApi(proxy_config=proxy_config)
         fetched = ytt.fetch(video_id, languages=[lang, "en"])
         chunks = [snippet.text for snippet in fetched]
     except (TranscriptsDisabled, NoTranscriptFound, VideoUnavailable) as e:
@@ -290,6 +299,15 @@ with st.sidebar:
     model = st.text_input("Model", value="claude-sonnet-4.5", help="Model name as listed in your AICredits catalog")
 
     st.markdown("---")
+    st.subheader("Proxy (recommended for hosted apps)")
+    st.caption(
+        "YouTube blocks most cloud/datacenter IPs. If transcript fetching fails with a "
+        "block/rate-limit error, add Webshare proxy credentials here. Get free ones at webshare.io."
+    )
+    proxy_username_input = st.text_input("Webshare proxy username", value="")
+    proxy_password_input = st.text_input("Webshare proxy password", type="password", value="")
+
+    st.markdown("---")
     st.subheader("Email this summary")
     send_email = st.checkbox("Email me the result")
     to_email = st.text_input("Recipient email", value="", disabled=not send_email)
@@ -329,7 +347,11 @@ if go:
         st.image(f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg")
 
         with st.spinner("Fetching transcript..."):
-            transcript = fetch_transcript(video_id)
+            transcript = fetch_transcript(
+                video_id,
+                proxy_username=proxy_username_input or None,
+                proxy_password=proxy_password_input or None,
+            )
 
         status = st.empty()
         summary = summarize_transcript(
