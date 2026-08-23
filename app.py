@@ -268,36 +268,48 @@ def send_summary_email_resend(resend_api_key, from_addr, to_addr, subject, html_
 # --------------------------------------------------------------------------
 # Streamlit UI
 # --------------------------------------------------------------------------
-def get_secret(name: str, default=None):
-    """Check st.secrets first (Streamlit Cloud), then env vars (local run)."""
-    try:
-        if name in st.secrets:
-            return st.secrets[name]
-    except Exception:
-        pass
-    return os.environ.get(name, default)
 
 
 st.title("📺 YouTube Video Summarizer")
 st.caption("Paste a YouTube link → get an Overview, Key Points, and Takeaways.")
 
 with st.sidebar:
-    st.subheader("Settings")
+    st.subheader("Required settings")
+    aicredits_key_input = st.text_input(
+        "AICredits API key *", type="password",
+        help="Required. Get one at aicredits.in",
+    )
+    resend_key_input = st.text_input(
+        "Resend API key *", type="password",
+        help="Required. Get one free at resend.com",
+    )
+    st.caption("* Both keys are required to use this app.")
+
+    st.markdown("---")
+    st.subheader("Model")
     model = st.text_input("Model", value="claude-sonnet-4.5", help="Model name as listed in your AICredits catalog")
-    api_key_input = st.text_input("AICredits API key (optional override)", type="password",
-                                   help="Leave blank to use the key configured by the app owner")
+
     st.markdown("---")
     st.subheader("Email this summary")
     send_email = st.checkbox("Email me the result")
     to_email = st.text_input("Recipient email", value="", disabled=not send_email)
+    from_addr_input = st.text_input(
+        "Sender address", value="onboarding@resend.dev", disabled=not send_email,
+        help="Defaults to Resend's shared test address, which only delivers to the email "
+             "you signed up to Resend with, unless you've verified your own domain.",
+    )
 
 url = st.text_input("YouTube video URL", placeholder="https://www.youtube.com/watch?v=...")
 go = st.button("Summarize", type="primary", use_container_width=True)
 
 if go:
-    aicredits_key = api_key_input or get_secret("AICREDITS_API_KEY")
-    if not aicredits_key:
-        st.error("No AICredits API key configured. Add one in the sidebar, or ask the app owner to set AICREDITS_API_KEY in secrets.")
+    missing = []
+    if not aicredits_key_input:
+        missing.append("AICredits API key")
+    if not resend_key_input:
+        missing.append("Resend API key")
+    if missing:
+        st.error(f"Please fill in the required field(s) in the sidebar: {', '.join(missing)}.")
         st.stop()
     if not url:
         st.error("Please paste a YouTube URL.")
@@ -305,6 +317,9 @@ if go:
     if send_email and not to_email:
         st.error("Please enter a recipient email address, or uncheck 'Email me the result'.")
         st.stop()
+
+    aicredits_key = aicredits_key_input
+    resend_key = resend_key_input
 
     try:
         with st.spinner("Extracting video ID..."):
@@ -342,22 +357,17 @@ if go:
         )
 
         if send_email:
-            resend_key = get_secret("RESEND_API_KEY")
-            from_addr = get_secret("RESEND_FROM", "onboarding@resend.dev")
-            if not resend_key:
-                st.warning("Email skipped: no RESEND_API_KEY configured in secrets.")
-            else:
-                with st.spinner(f"Sending email to {to_email}..."):
-                    try:
-                        html_body = render_html_email(video_url, video_id, model, summary)
-                        text_body = f"Video Summary: {video_url}\n\n{summary}"
-                        send_summary_email_resend(
-                            resend_key, from_addr, to_email,
-                            f"Video Summary: {video_url}", html_body, text_body,
-                        )
-                        st.success(f"Email sent to {to_email}")
-                    except Exception as e:
-                        st.error(f"Failed to send email: {e}")
+            with st.spinner(f"Sending email to {to_email}..."):
+                try:
+                    html_body = render_html_email(video_url, video_id, model, summary)
+                    text_body = f"Video Summary: {video_url}\n\n{summary}"
+                    send_summary_email_resend(
+                        resend_key, from_addr_input, to_email,
+                        f"Video Summary: {video_url}", html_body, text_body,
+                    )
+                    st.success(f"Email sent to {to_email}")
+                except Exception as e:
+                    st.error(f"Failed to send email: {e}")
 
     except Exception as e:
         st.error(str(e))
