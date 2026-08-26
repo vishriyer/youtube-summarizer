@@ -53,6 +53,24 @@ def extract_video_id(url: str) -> str:
     raise ValueError(f"Could not extract a video ID from URL: {url}")
 
 
+def fetch_video_title(video_url: str) -> str:
+    """Fetch the video's title via YouTube's public oEmbed endpoint — a
+    lightweight, unauthenticated metadata lookup (separate from the
+    transcript-scraping endpoint that gets IP-blocked), so no API key
+    or proxy is needed for this."""
+    query = urllib.parse.urlencode({"url": video_url, "format": "json"})
+    req = urllib.request.Request(
+        f"https://www.youtube.com/oembed?{query}",
+        headers={"User-Agent": "youtube-summarizer/1.0"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            return data.get("title", "").strip()
+    except Exception:
+        return ""  # Fall back gracefully — title is a nice-to-have, not critical
+
+
 SUPADATA_API_URL = "https://api.supadata.ai/v1/transcript"
 
 
@@ -235,7 +253,7 @@ def parse_summary_sections(summary_md: str) -> dict:
 SECTION_ICONS = {"overview": "🎬", "key points": "🔑", "takeaways": "✅"}
 
 
-def render_html_email(video_url: str, video_id: str, model: str, summary_md: str) -> str:
+def render_html_email(video_url: str, video_id: str, model: str, summary_md: str, video_title: str = "") -> str:
     sections = parse_summary_sections(summary_md)
     thumbnail_url = f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
 
@@ -275,7 +293,8 @@ def render_html_email(video_url: str, video_id: str, model: str, summary_md: str
 <tr><td style="background:#1a1a1a;padding:0;"><img src="{thumbnail_url}" width="600" style="display:block;width:100%;max-width:600px;height:auto;" alt="Video thumbnail"></td></tr>
 <tr><td style="padding:28px 28px 8px 28px;">
 <div style="font-size:12px;font-weight:600;color:#d97757;letter-spacing:.08em;text-transform:uppercase;margin-bottom:6px;">Video Summary</div>
-<a href="{video_url}" style="font-size:15px;color:#1a1a1a;text-decoration:none;word-break:break-all;">{video_url}</a>
+{f'<div style="font-size:18px;font-weight:700;color:#1a1a1a;margin-bottom:6px;line-height:1.3;">{video_title}</div>' if video_title else ''}
+<a href="{video_url}" style="font-size:14px;color:#999;text-decoration:none;word-break:break-all;">{video_url}</a>
 </td></tr>
 <tr><td style="padding:20px 28px 6px 28px;"><table role="presentation" width="100%" cellpadding="0" cellspacing="0">{"".join(body_parts)}</table></td></tr>
 <tr><td style="padding:4px 28px 28px 28px;border-top:1px solid #eee;">
@@ -287,10 +306,12 @@ def render_html_email(video_url: str, video_id: str, model: str, summary_md: str
 RESEND_API_URL = "https://api.resend.com/emails"
 
 
-def send_summary_email_resend(resend_api_key, from_addr, to_addr, subject, html_body, text_body):
+def send_summary_email_resend(resend_api_key, from_addr, to_addrs, subject, html_body, text_body):
     import urllib.request
     import urllib.error
-    payload = {"from": from_addr, "to": [to_addr], "subject": subject, "html": html_body, "text": text_body}
+    if isinstance(to_addrs, str):
+        to_addrs = [to_addrs]
+    payload = {"from": from_addr, "to": to_addrs, "subject": subject, "html": html_body, "text": text_body}
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
         RESEND_API_URL, data=data, method="POST",
@@ -313,25 +334,38 @@ def send_summary_email_resend(resend_api_key, from_addr, to_addr, subject, html_
 # --------------------------------------------------------------------------
 
 
+def get_secret(name: str, default=""):
+    """Read from Streamlit secrets first (configured once by you in the
+    Cloud dashboard), falling back to an env var, then a blank default."""
+    try:
+        if name in st.secrets:
+            return st.secrets[name]
+    except Exception:
+        pass
+    return os.environ.get(name, default)
+
+
 st.title("📺 YouTube Video Summarizer")
 st.caption("Paste a YouTube link → get an Overview, Key Points, and Takeaways.")
 
 with st.sidebar:
-    st.subheader("Required settings")
+    st.subheader("Settings")
+    st.caption("Pre-filled from your configured secrets. Override here only if needed for this session.")
     aicredits_key_input = st.text_input(
         "AICredits API key *", type="password",
-        help="Required. Get one at aicredits.in",
+        value=get_secret("AICREDITS_API_KEY"),
+        help="Get one at aicredits.in",
     )
     supadata_key_input = st.text_input(
         "Supadata API key *", type="password",
-        help="Required. Get one free at supadata.ai (100 free requests/month). "
-             "Used to fetch the video transcript reliably from cloud hosting.",
+        value=get_secret("SUPADATA_API_KEY"),
+        help="Get one free at supadata.ai (100 free requests/month).",
     )
     resend_key_input = st.text_input(
         "Resend API key *", type="password",
-        help="Required. Get one free at resend.com",
+        value=get_secret("RESEND_API_KEY"),
+        help="Get one free at resend.com",
     )
-    st.caption("* All three keys are required to use this app.")
 
     st.markdown("---")
     st.subheader("Model")
@@ -339,12 +373,17 @@ with st.sidebar:
 
     st.markdown("---")
     st.subheader("Email this summary")
-    send_email = st.checkbox("Email me the result")
-    to_email = st.text_input("Recipient email", value="", disabled=not send_email)
+    default_sender = get_secret("RESEND_FROM", "onboarding@resend.dev")
+    default_recipient = get_secret("EMAIL_TO", "")
+    send_email = st.checkbox("Email me the result", value=bool(default_recipient))
+    to_email = st.text_input(
+        "Send to", value=default_recipient, disabled=not send_email,
+        help="Without a verified domain in Resend, this can only be the email address "
+             "you signed up to Resend with.",
+    )
     from_addr_input = st.text_input(
-        "Sender address", value="onboarding@resend.dev", disabled=not send_email,
-        help="Defaults to Resend's shared test address, which only delivers to the email "
-             "you signed up to Resend with, unless you've verified your own domain.",
+        "Sender address", value=default_sender, disabled=not send_email,
+        help="Defaults to Resend's shared test address.",
     )
 
 url = st.text_input("YouTube video URL", placeholder="https://www.youtube.com/watch?v=...")
@@ -359,14 +398,23 @@ if go:
     if not resend_key_input:
         missing.append("Resend API key")
     if missing:
-        st.error(f"Please fill in the required field(s) in the sidebar: {', '.join(missing)}.")
+        st.error(f"Missing required key(s): {', '.join(missing)}. Add them in the sidebar or in app secrets.")
         st.stop()
     if not url:
         st.error("Please paste a YouTube URL.")
         st.stop()
-    if send_email and not to_email:
-        st.error("Please enter a recipient email address, or uncheck 'Email me the result'.")
-        st.stop()
+
+    recipient_list = []
+    if send_email:
+        if not to_email:
+            st.error("Please enter a recipient email address, or uncheck 'Email me the result'.")
+            st.stop()
+        raw_addrs = [a.strip() for a in to_email.split(",") if a.strip()]
+        invalid = [a for a in raw_addrs if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", a)]
+        if invalid:
+            st.error(f"These don't look like valid email addresses: {', '.join(invalid)}")
+            st.stop()
+        recipient_list = raw_addrs
 
     aicredits_key = aicredits_key_input
     resend_key = resend_key_input
@@ -377,6 +425,10 @@ if go:
             video_url = f"https://youtu.be/{video_id}"
 
         st.image(f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg")
+
+        video_title = fetch_video_title(video_url)
+        if video_title:
+            st.markdown(f"**{video_title}**")
 
         with st.spinner("Fetching transcript via Supadata..."):
             transcript = fetch_transcript(video_url, supadata_key_input)
@@ -390,9 +442,9 @@ if go:
 
         st.success("Done!")
         sections = parse_summary_sections(summary)
-        for title, lines in sections.items():
-            icon = SECTION_ICONS.get(title.strip().lower(), "📌")
-            st.subheader(f"{icon} {title}")
+        for section_title, lines in sections.items():
+            icon = SECTION_ICONS.get(section_title.strip().lower(), "📌")
+            st.subheader(f"{icon} {section_title}")
             for line in lines:
                 if line.startswith(("-", "*", "•")):
                     st.markdown(f"- {re.sub(r'^[-*•]\\s*', '', line)}")
@@ -401,21 +453,23 @@ if go:
 
         st.download_button(
             "⬇️ Download summary (.md)",
-            data=f"# Summary: {video_url}\n\n{summary}\n",
+            data=f"# Summary: {video_title or video_url}\n{video_url}\n\n{summary}\n",
             file_name="video_summary.md",
             mime="text/markdown",
         )
 
         if send_email:
-            with st.spinner(f"Sending email to {to_email}..."):
+            email_subject = f"Video Summary: {video_title}" if video_title else f"Video Summary: {video_url}"
+            recipients_display = ", ".join(recipient_list)
+            with st.spinner(f"Sending email to {recipients_display}..."):
                 try:
-                    html_body = render_html_email(video_url, video_id, model, summary)
-                    text_body = f"Video Summary: {video_url}\n\n{summary}"
+                    html_body = render_html_email(video_url, video_id, model, summary, video_title=video_title)
+                    text_body = f"{video_title or 'Video Summary'}\n{video_url}\n\n{summary}"
                     send_summary_email_resend(
-                        resend_key, from_addr_input, to_email,
-                        f"Video Summary: {video_url}", html_body, text_body,
+                        resend_key, from_addr_input, recipient_list,
+                        email_subject, html_body, text_body,
                     )
-                    st.success(f"Email sent to {to_email}")
+                    st.success(f"Email sent to {recipients_display}")
                 except Exception as e:
                     st.error(f"Failed to send email: {e}")
 
