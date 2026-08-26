@@ -53,6 +53,85 @@ def extract_video_id(url: str) -> str:
     raise ValueError(f"Could not extract a video ID from URL: {url}")
 
 
+def is_apple_podcast_url(url: str) -> bool:
+    host = urlparse(url.strip()).netloc.lower()
+    return "podcasts.apple.com" in host
+
+
+def resolve_apple_podcast_episode(url: str) -> dict:
+    """Turn an Apple Podcasts episode URL into a direct, publicly fetchable
+    MP3 URL plus title/artwork, using Apple's own public iTunes Lookup API
+    (no scraping, no auth needed)."""
+    parsed = urlparse(url.strip())
+    qs = parse_qs(parsed.query)
+    episode_id = qs.get("i", [None])[0]
+    if not episode_id:
+        raise ValueError(
+            "That looks like a podcast show link, not a specific episode. "
+            "Open the episode itself in Apple Podcasts and copy that URL "
+            "(it should contain '?i=' followed by numbers)."
+        )
+
+    query = urllib.parse.urlencode({"id": episode_id, "entity": "podcastEpisode"})
+    req = urllib.request.Request(
+        f"https://itunes.apple.com/lookup?{query}",
+        headers={"User-Agent": "youtube-summarizer/1.0"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:
+        raise RuntimeError(f"Couldn't look up this episode via Apple's API: {e}")
+
+    results = data.get("results", [])
+    if not results:
+        raise RuntimeError("Apple's API returned no results for this episode link.")
+
+    ep = results[0]
+    audio_url = ep.get("episodeUrl")
+    if not audio_url:
+        raise RuntimeError(
+            "Found the episode, but Apple didn't provide a direct audio URL for it "
+            "(some episodes restrict this)."
+        )
+
+    return {
+        "audio_url": audio_url,
+        "title": ep.get("trackName", "").strip(),
+        "show_name": ep.get("collectionName", "").strip(),
+        "artwork_url": ep.get("artworkUrl600") or ep.get("artworkUrl100") or "",
+    }
+
+
+def resolve_media(url: str) -> dict:
+    """Unified entry point: figures out whether the input is a YouTube video
+    or an Apple Podcasts episode, and returns a common shape:
+    {platform, media_url, display_url, title, thumbnail_url}"""
+    url = url.strip()
+    if is_apple_podcast_url(url):
+        info = resolve_apple_podcast_episode(url)
+        title = info["title"]
+        if info["show_name"]:
+            title = f"{title} — {info['show_name']}" if title else info["show_name"]
+        return {
+            "platform": "apple_podcasts",
+            "media_url": info["audio_url"],
+            "display_url": url,
+            "title": title,
+            "thumbnail_url": info["artwork_url"],
+        }
+    else:
+        video_id = extract_video_id(url)
+        video_url = f"https://youtu.be/{video_id}"
+        return {
+            "platform": "youtube",
+            "media_url": video_url,
+            "display_url": video_url,
+            "title": fetch_video_title(video_url),
+            "thumbnail_url": f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg",
+        }
+
+
 def fetch_video_title(video_url: str) -> str:
     """Fetch the video's title via YouTube's public oEmbed endpoint — a
     lightweight, unauthenticated metadata lookup (separate from the
@@ -253,17 +332,16 @@ def parse_summary_sections(summary_md: str) -> dict:
 SECTION_ICONS = {"overview": "🎬", "key points": "🔑", "takeaways": "✅"}
 
 
-def render_html_email(video_url: str, video_id: str, model: str, summary_md: str, video_title: str = "") -> str:
+def render_html_email(media_url: str, model: str, summary_md: str, title: str = "", thumbnail_url: str = "") -> str:
     sections = parse_summary_sections(summary_md)
-    thumbnail_url = f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
 
     def inline_md(text):
         text = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", text)
         return re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"<em>\1</em>", text)
 
     body_parts = []
-    for title, lines in sections.items():
-        icon = SECTION_ICONS.get(title.strip().lower(), "📌")
+    for section_title, lines in sections.items():
+        icon = SECTION_ICONS.get(section_title.strip().lower(), "📌")
         is_bullets = all(l.startswith(("-", "*", "•")) for l in lines) and len(lines) > 1
         if is_bullets:
             items = ""
@@ -279,26 +357,32 @@ def render_html_email(video_url: str, video_id: str, model: str, summary_md: str
         <tr><td style="padding:0 0 28px 0;">
           <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-left:4px solid #d97757;background:#fff9f6;border-radius:8px;">
             <tr><td style="padding:18px 22px;">
-              <div style="font-size:15px;font-weight:700;color:#1a1a1a;letter-spacing:.02em;text-transform:uppercase;margin-bottom:12px;">{icon}&nbsp;&nbsp;{title}</div>
+              <div style="font-size:15px;font-weight:700;color:#1a1a1a;letter-spacing:.02em;text-transform:uppercase;margin-bottom:12px;">{icon}&nbsp;&nbsp;{section_title}</div>
               {content_html}
             </td></tr>
           </table>
         </td></tr>''')
+
+    thumbnail_html = (
+        f'<tr><td style="background:#1a1a1a;padding:0;"><img src="{thumbnail_url}" width="600" '
+        f'style="display:block;width:100%;max-width:600px;height:auto;" alt="Thumbnail"></td></tr>'
+        if thumbnail_url else ""
+    )
 
     return f'''<!DOCTYPE html><html><head><meta charset="utf-8"></head>
 <body style="margin:0;padding:0;background:#f2ede8;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">
 <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f2ede8;padding:32px 16px;">
 <tr><td align="center">
 <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;background:#ffffff;border-radius:14px;overflow:hidden;box-shadow:0 2px 12px rgba(0,0,0,0.06);">
-<tr><td style="background:#1a1a1a;padding:0;"><img src="{thumbnail_url}" width="600" style="display:block;width:100%;max-width:600px;height:auto;" alt="Video thumbnail"></td></tr>
+{thumbnail_html}
 <tr><td style="padding:28px 28px 8px 28px;">
-<div style="font-size:12px;font-weight:600;color:#d97757;letter-spacing:.08em;text-transform:uppercase;margin-bottom:6px;">Video Summary</div>
-{f'<div style="font-size:18px;font-weight:700;color:#1a1a1a;margin-bottom:6px;line-height:1.3;">{video_title}</div>' if video_title else ''}
-<a href="{video_url}" style="font-size:14px;color:#999;text-decoration:none;word-break:break-all;">{video_url}</a>
+<div style="font-size:12px;font-weight:600;color:#d97757;letter-spacing:.08em;text-transform:uppercase;margin-bottom:6px;">Summary</div>
+{f'<div style="font-size:18px;font-weight:700;color:#1a1a1a;margin-bottom:6px;line-height:1.3;">{title}</div>' if title else ''}
+<a href="{media_url}" style="font-size:14px;color:#999;text-decoration:none;word-break:break-all;">{media_url}</a>
 </td></tr>
 <tr><td style="padding:20px 28px 6px 28px;"><table role="presentation" width="100%" cellpadding="0" cellspacing="0">{"".join(body_parts)}</table></td></tr>
 <tr><td style="padding:4px 28px 28px 28px;border-top:1px solid #eee;">
-<p style="margin:16px 0 0 0;font-size:12px;color:#999;line-height:1.5;">Generated automatically from the video's captions using {model} via AICredits. Some nuance may be lost — watch the full video for complete context.</p>
+<p style="margin:16px 0 0 0;font-size:12px;color:#999;line-height:1.5;">Generated automatically from the source audio/captions using {model} via AICredits. Some nuance may be lost — check the original for complete context.</p>
 </td></tr>
 </table></td></tr></table></body></html>'''
 
@@ -345,8 +429,8 @@ def get_secret(name: str, default=""):
     return os.environ.get(name, default)
 
 
-st.title("📺 YouTube Video Summarizer")
-st.caption("Paste a YouTube link → get an Overview, Key Points, and Takeaways.")
+st.title("📺🎙️ Video & Podcast Summarizer")
+st.caption("Paste a YouTube link or an Apple Podcasts episode link → get an Overview, Key Points, and Takeaways.")
 
 with st.sidebar:
     st.subheader("Settings")
@@ -386,7 +470,10 @@ with st.sidebar:
         help="Defaults to Resend's shared test address.",
     )
 
-url = st.text_input("YouTube video URL", placeholder="https://www.youtube.com/watch?v=...")
+url = st.text_input(
+    "Video or podcast episode URL",
+    placeholder="https://www.youtube.com/watch?v=... or https://podcasts.apple.com/.../id.../?i=...",
+)
 go = st.button("Summarize", type="primary", use_container_width=True)
 
 if go:
@@ -401,7 +488,7 @@ if go:
         st.error(f"Missing required key(s): {', '.join(missing)}. Add them in the sidebar or in app secrets.")
         st.stop()
     if not url:
-        st.error("Please paste a YouTube URL.")
+        st.error("Please paste a YouTube or Apple Podcasts URL.")
         st.stop()
 
     recipient_list = []
@@ -420,18 +507,17 @@ if go:
     resend_key = resend_key_input
 
     try:
-        with st.spinner("Extracting video ID..."):
-            video_id = extract_video_id(url)
-            video_url = f"https://youtu.be/{video_id}"
+        with st.spinner("Looking up the episode/video..."):
+            media = resolve_media(url)
 
-        st.image(f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg")
+        if media["thumbnail_url"]:
+            st.image(media["thumbnail_url"])
+        if media["title"]:
+            st.markdown(f"**{media['title']}**")
 
-        video_title = fetch_video_title(video_url)
-        if video_title:
-            st.markdown(f"**{video_title}**")
-
-        with st.spinner("Fetching transcript via Supadata..."):
-            transcript = fetch_transcript(video_url, supadata_key_input)
+        fetch_label = "Fetching transcript" if media["platform"] == "youtube" else "Transcribing episode audio"
+        with st.spinner(f"{fetch_label} via Supadata..."):
+            transcript = fetch_transcript(media["media_url"], supadata_key_input, poll_timeout=300)
 
         status = st.empty()
         summary = summarize_transcript(
@@ -451,20 +537,24 @@ if go:
                 else:
                     st.write(line)
 
+        display_title = media["title"] or media["display_url"]
         st.download_button(
             "⬇️ Download summary (.md)",
-            data=f"# Summary: {video_title or video_url}\n{video_url}\n\n{summary}\n",
-            file_name="video_summary.md",
+            data=f"# Summary: {display_title}\n{media['display_url']}\n\n{summary}\n",
+            file_name="summary.md",
             mime="text/markdown",
         )
 
         if send_email:
-            email_subject = f"Video Summary: {video_title}" if video_title else f"Video Summary: {video_url}"
+            email_subject = f"Summary: {display_title}"
             recipients_display = ", ".join(recipient_list)
             with st.spinner(f"Sending email to {recipients_display}..."):
                 try:
-                    html_body = render_html_email(video_url, video_id, model, summary, video_title=video_title)
-                    text_body = f"{video_title or 'Video Summary'}\n{video_url}\n\n{summary}"
+                    html_body = render_html_email(
+                        media["display_url"], model, summary,
+                        title=media["title"], thumbnail_url=media["thumbnail_url"],
+                    )
+                    text_body = f"{display_title}\n{media['display_url']}\n\n{summary}"
                     send_summary_email_resend(
                         resend_key, from_addr_input, recipient_list,
                         email_subject, html_body, text_body,
