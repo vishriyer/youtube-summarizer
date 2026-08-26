@@ -7,10 +7,9 @@ summary (Overview / Key Points / Takeaways). Optionally email it via Resend.
 Deploy for free on Streamlit Community Cloud (share.streamlit.io):
     1. Push this file + requirements.txt to a GitHub repo.
     2. Go to share.streamlit.io, connect the repo, point it at app.py.
-    3. In the app's "Secrets" settings, add:
-         AICREDITS_API_KEY = "your-key"
-         RESEND_API_KEY = "your-key"        # optional, only if you want email
-    4. Deploy. You get a public URL like https://yourapp.streamlit.app
+    3. Deploy. You get a public URL like https://yourapp.streamlit.app
+    (No secrets needed — AICredits, Resend, and Supadata keys are entered
+    by the user directly in the app's sidebar.)
 
 Run locally:
     pip install -r requirements.txt
@@ -20,6 +19,10 @@ Run locally:
 import os
 import re
 import json
+import time
+import urllib.request
+import urllib.parse
+import urllib.error
 import streamlit as st
 from urllib.parse import urlparse, parse_qs
 
@@ -50,32 +53,63 @@ def extract_video_id(url: str) -> str:
     raise ValueError(f"Could not extract a video ID from URL: {url}")
 
 
-def fetch_transcript(video_id: str, lang: str = "en", proxy_username: str = None, proxy_password: str = None) -> str:
-    from youtube_transcript_api import YouTubeTranscriptApi
-    from youtube_transcript_api._errors import (
-        TranscriptsDisabled, NoTranscriptFound, VideoUnavailable,
-    )
+SUPADATA_API_URL = "https://api.supadata.ai/v1/transcript"
 
-    proxy_config = None
-    if proxy_username and proxy_password:
-        from youtube_transcript_api.proxies import WebshareProxyConfig
-        proxy_config = WebshareProxyConfig(
-            proxy_username=proxy_username,
-            proxy_password=proxy_password,
-        )
 
-    try:
-        ytt = YouTubeTranscriptApi(proxy_config=proxy_config)
-        fetched = ytt.fetch(video_id, languages=[lang, "en"])
-        chunks = [snippet.text for snippet in fetched]
-    except (TranscriptsDisabled, NoTranscriptFound, VideoUnavailable) as e:
-        raise RuntimeError(
-            f"No usable transcript/captions available for this video ({e.__class__.__name__}). "
-            "This tool relies on existing captions and can't transcribe audio itself."
+def fetch_transcript(video_url: str, supadata_api_key: str, lang: str = "en", poll_timeout: int = 120) -> str:
+    """Fetch a transcript via the Supadata API instead of scraping YouTube
+    directly. Supadata handles IP-block avoidance and AI fallback on its
+    own infrastructure, so this works reliably from cloud-hosted apps."""
+
+    def _request(url: str):
+        req = urllib.request.Request(
+            url,
+            headers={
+                "x-api-key": supadata_api_key.strip(),
+                "User-Agent": "youtube-summarizer/1.0",
+                "Accept": "application/json",
+            },
         )
-    text = " ".join(chunks)
-    text = re.sub(r"[\u200b-\u200f\u202a-\u202e\ufeff]", "", text)
-    return text
+        try:
+            with urllib.request.urlopen(req) as resp:
+                return resp.status, json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"Supadata API error ({e.code}): {body}")
+
+    query = urllib.parse.urlencode({"url": video_url, "lang": lang, "text": "true"})
+    status, data = _request(f"{SUPADATA_API_URL}?{query}")
+
+    if status == 200:
+        content = data.get("content", "")
+        if not content:
+            raise RuntimeError(
+                "Supadata returned an empty transcript (no speech detected, or the video "
+                "has no captions and AI transcription found nothing)."
+            )
+        return re.sub(r"[\u200b-\u200f\u202a-\u202e\ufeff]", "", content)
+
+    if status == 202:
+        job_id = data.get("jobId")
+        if not job_id:
+            raise RuntimeError(f"Supadata returned 202 but no jobId: {data}")
+        deadline = time.time() + poll_timeout
+        while time.time() < deadline:
+            time.sleep(1)
+            _, job_data = _request(f"{SUPADATA_API_URL}/{job_id}")
+            job_status = job_data.get("status")
+            if job_status == "completed":
+                result = job_data.get("result", {})
+                content = result.get("content", "") if isinstance(result, dict) else result
+                if not content:
+                    raise RuntimeError("Supadata job completed but returned no transcript content.")
+                return re.sub(r"[\u200b-\u200f\u202a-\u202e\ufeff]", "", content)
+            if job_status == "failed":
+                raise RuntimeError(f"Supadata transcription job failed: {job_data.get('error')}")
+            # else: queued/active — keep polling
+        raise RuntimeError("Timed out waiting for Supadata to finish transcribing this video.")
+
+    raise RuntimeError(f"Unexpected response from Supadata (status {status}): {data}")
 
 
 def chunk_text(text: str, max_chars: int = 60000):
@@ -288,24 +322,20 @@ with st.sidebar:
         "AICredits API key *", type="password",
         help="Required. Get one at aicredits.in",
     )
+    supadata_key_input = st.text_input(
+        "Supadata API key *", type="password",
+        help="Required. Get one free at supadata.ai (100 free requests/month). "
+             "Used to fetch the video transcript reliably from cloud hosting.",
+    )
     resend_key_input = st.text_input(
         "Resend API key *", type="password",
         help="Required. Get one free at resend.com",
     )
-    st.caption("* Both keys are required to use this app.")
+    st.caption("* All three keys are required to use this app.")
 
     st.markdown("---")
     st.subheader("Model")
     model = st.text_input("Model", value="claude-sonnet-4.5", help="Model name as listed in your AICredits catalog")
-
-    st.markdown("---")
-    st.subheader("Proxy (recommended for hosted apps)")
-    st.caption(
-        "YouTube blocks most cloud/datacenter IPs. If transcript fetching fails with a "
-        "block/rate-limit error, add Webshare proxy credentials here. Get free ones at webshare.io."
-    )
-    proxy_username_input = st.text_input("Webshare proxy username", value="")
-    proxy_password_input = st.text_input("Webshare proxy password", type="password", value="")
 
     st.markdown("---")
     st.subheader("Email this summary")
@@ -324,6 +354,8 @@ if go:
     missing = []
     if not aicredits_key_input:
         missing.append("AICredits API key")
+    if not supadata_key_input:
+        missing.append("Supadata API key")
     if not resend_key_input:
         missing.append("Resend API key")
     if missing:
@@ -346,12 +378,8 @@ if go:
 
         st.image(f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg")
 
-        with st.spinner("Fetching transcript..."):
-            transcript = fetch_transcript(
-                video_id,
-                proxy_username=proxy_username_input or None,
-                proxy_password=proxy_password_input or None,
-            )
+        with st.spinner("Fetching transcript via Supadata..."):
+            transcript = fetch_transcript(video_url, supadata_key_input)
 
         status = st.empty()
         summary = summarize_transcript(
